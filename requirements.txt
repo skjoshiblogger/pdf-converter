@@ -1,7 +1,6 @@
 fastapi
 uvicorn
+python-multipart
 pdfplumber
 pandas
 openpyxl
-python-docx
-python-multipart
