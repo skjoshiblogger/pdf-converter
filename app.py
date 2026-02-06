@@ -1,93 +1,77 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import FileResponse
+from flask import Flask, request, send_file, jsonify
+from flask_cors import CORS
 import pdfplumber
 import pandas as pd
-import uuid
 import os
-import shutil
-import re
+import uuid
 
-app = FastAPI(title="Bank Statement PDF to Excel")
+app = Flask(__name__)
+CORS(app)
 
-BASE_DIR = "files"
-os.makedirs(BASE_DIR, exist_ok=True)
+UPLOAD_DIR = "files"
+MAX_FILE_SIZE_MB = 5
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-@app.get("/")
+@app.route("/", methods=["GET"])
 def home():
-    return {
-        "status": "running",
-        "service": "Bank Statement PDF to Excel",
-        "endpoint": "/bank-statement-to-excel"
-    }
+    return {"status": "Bank Statement API running"}
 
-def parse_amount(val):
-    if not val:
-        return ""
-    val = val.replace(",", "").strip()
-    return val if re.match(r"^-?\d+(\.\d+)?$", val) else ""
-
-@app.post("/bank-statement-to-excel")
-async def bank_statement_to_excel(file: UploadFile = File(...)):
+# ---------- VALIDATION ----------
+def validate_pdf(file):
     if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files allowed")
+        return "Only PDF files allowed"
+    file.seek(0, os.SEEK_END)
+    size_mb = file.tell() / (1024 * 1024)
+    file.seek(0)
+    if size_mb > MAX_FILE_SIZE_MB:
+        return f"File too large. Max {MAX_FILE_SIZE_MB}MB allowed"
+    return None
 
-    uid = str(uuid.uuid4())
-    pdf_path = f"{BASE_DIR}/{uid}.pdf"
-    excel_path = f"{BASE_DIR}/{uid}.xlsx"
+# ---------- BANK STATEMENT EXTRACT ----------
+@app.route("/bank-statement", methods=["POST"])
+def bank_statement():
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
 
-    with open(pdf_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+    file = request.files["file"]
+    error = validate_pdf(file)
+    if error:
+        return jsonify({"error": error}), 400
+
+    pdf_path = f"{UPLOAD_DIR}/{uuid.uuid4()}.pdf"
+    xls_path = pdf_path.replace(".pdf", ".xlsx")
+    file.save(pdf_path)
 
     rows = []
 
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
-            text = page.extract_text()
-            if not text:
+            table = page.extract_table()
+            if not table:
                 continue
 
-            lines = text.split("\n")
-
-            for line in lines:
-                # Common Indian bank format
-                # DATE | DESCRIPTION | DEBIT | CREDIT | BALANCE
-                match = re.match(
-                    r"(\d{2}[-/]\d{2}[-/]\d{4})\s+(.*)\s+([\d,]*\.\d{2})?\s*([\d,]*\.\d{2})?\s+([\d,]*\.\d{2})",
-                    line
-                )
-
-                if match:
-                    date = match.group(1)
-                    desc = match.group(2)
-                    debit = parse_amount(match.group(3))
-                    credit = parse_amount(match.group(4))
-                    balance = parse_amount(match.group(5))
-
-                    rows.append({
-                        "Date": date,
-                        "Description": desc,
-                        "Debit": debit,
-                        "Credit": credit,
-                        "Balance": balance
-                    })
+            for row in table[1:]:  # skip header
+                if len(row) < 5:
+                    continue
+                rows.append({
+                    "Date": row[0],
+                    "Description": row[1],
+                    "Debit": row[2],
+                    "Credit": row[3],
+                    "Balance": row[4]
+                })
 
     if not rows:
-        raise HTTPException(
-            status_code=422,
-            detail="No transactions detected. Scanned PDFs need OCR (paid add-on)."
-        )
+        return jsonify({"error": "No bank data detected"}), 400
 
     df = pd.DataFrame(rows)
+    df.to_excel(xls_path, index=False)
 
-    # Clean columns
-    df["Debit"] = pd.to_numeric(df["Debit"], errors="coerce")
-    df["Credit"] = pd.to_numeric(df["Credit"], errors="coerce")
-    df["Balance"] = pd.to_numeric(df["Balance"], errors="coerce")
-
-    df.to_excel(excel_path, index=False)
-
-    return FileResponse(
-        excel_path,
-        filename="bank_statement.xlsx",
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    return send_file(
+        xls_path,
+        as_attachment=True,
+        download_name="bank_statement.xlsx"
     )
+
+if __name__ == "__main__":
+    app.run(debug=True)
