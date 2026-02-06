@@ -5,29 +5,40 @@ import pandas as pd
 import os
 import uuid
 
+# ---------------- APP SETUP ----------------
 app = Flask(__name__)
 CORS(app)
 
-UPLOAD_DIR = "files"
+BASE_DIR = "files"
 MAX_FILE_SIZE_MB = 5
-os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+os.makedirs(BASE_DIR, exist_ok=True)
+
+# ---------------- HOME ----------------
 @app.route("/", methods=["GET"])
 def home():
-    return {"status": "Bank Statement API running"}
+    return jsonify({
+        "status": "PDF Bank Statement Converter API running",
+        "endpoints": {
+            "bank_statement": "/bank-statement (POST)"
+        }
+    })
 
-# ---------- VALIDATION ----------
+# ---------------- VALIDATION ----------------
 def validate_pdf(file):
     if not file.filename.lower().endswith(".pdf"):
-        return "Only PDF files allowed"
+        return "Only PDF files are allowed"
+
     file.seek(0, os.SEEK_END)
     size_mb = file.tell() / (1024 * 1024)
     file.seek(0)
+
     if size_mb > MAX_FILE_SIZE_MB:
-        return f"File too large. Max {MAX_FILE_SIZE_MB}MB allowed"
+        return f"File size exceeds {MAX_FILE_SIZE_MB}MB limit"
+
     return None
 
-# ---------- BANK STATEMENT EXTRACT ----------
+# ---------------- BANK STATEMENT EXTRACT ----------------
 @app.route("/bank-statement", methods=["POST"])
 def bank_statement():
     if "file" not in request.files:
@@ -38,40 +49,52 @@ def bank_statement():
     if error:
         return jsonify({"error": error}), 400
 
-    pdf_path = f"{UPLOAD_DIR}/{uuid.uuid4()}.pdf"
-    xls_path = pdf_path.replace(".pdf", ".xlsx")
+    pdf_name = f"{uuid.uuid4()}.pdf"
+    pdf_path = os.path.join(BASE_DIR, pdf_name)
+    excel_path = pdf_path.replace(".pdf", ".xlsx")
+
     file.save(pdf_path)
 
-    rows = []
+    extracted_rows = []
 
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            table = page.extract_table()
-            if not table:
-                continue
-
-            for row in table[1:]:  # skip header
-                if len(row) < 5:
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                table = page.extract_table()
+                if not table or len(table) < 2:
                     continue
-                rows.append({
-                    "Date": row[0],
-                    "Description": row[1],
-                    "Debit": row[2],
-                    "Credit": row[3],
-                    "Balance": row[4]
-                })
 
-    if not rows:
-        return jsonify({"error": "No bank data detected"}), 400
+                headers = table[0]
 
-    df = pd.DataFrame(rows)
-    df.to_excel(xls_path, index=False)
+                for row in table[1:]:
+                    if len(row) < 5:
+                        continue
 
-    return send_file(
-        xls_path,
-        as_attachment=True,
-        download_name="bank_statement.xlsx"
-    )
+                    extracted_rows.append({
+                        "Date": row[0],
+                        "Description": row[1],
+                        "Debit": row[2],
+                        "Credit": row[3],
+                        "Balance": row[4]
+                    })
 
+        if not extracted_rows:
+            return jsonify({"error": "No bank statement data detected"}), 400
+
+        df = pd.DataFrame(extracted_rows)
+        df.to_excel(excel_path, index=False)
+
+        return send_file(
+            excel_path,
+            as_attachment=True,
+            download_name="bank_statement.xlsx",
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+    finally:
+        # optional cleanup (keep files if debugging)
+        pass
+
+# ---------------- MAIN ----------------
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host="0.0.0.0", port=10000, debug=True)
