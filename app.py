@@ -1,91 +1,120 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import FileResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
 import pdfplumber
 import pandas as pd
-from docx import Document
-import uuid, os
+import re
+import uuid
+import os
 
-app = FastAPI()
+app = FastAPI(title="Bank Statement to Excel Converter")
 
-# CORS (required for browser)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+UPLOAD_DIR = "/tmp"
 
-BASE_DIR = "files"
-os.makedirs(BASE_DIR, exist_ok=True)
+DATE_REGEX = re.compile(r"\d{2}[-/]\d{2}[-/]\d{4}")
+AMOUNT_REGEX = re.compile(r"\d{1,3}(?:,\d{3})*(?:\.\d{2})?")
 
-@app.get("/")
-def home():
-    return {"status": "PDF Converter API running"}
+@app.post("/bank-statement-to-excel")
+async def bank_statement_to_excel(file: UploadFile = File(...)):
 
-# ---------------- PDF TO EXCEL ----------------
-@app.post("/pdf-to-excel")
-async def pdf_to_excel(file: UploadFile = File(...)):
-    try:
-        pdf_path = f"{BASE_DIR}/{uuid.uuid4()}.pdf"
-        excel_path = pdf_path.replace(".pdf", ".xlsx")
-
-        with open(pdf_path, "wb") as f:
-            f.write(await file.read())
-
-        all_rows = []
-
-        with pdfplumber.open(pdf_path) as pdf:
-            for page in pdf.pages:
-                tables = page.extract_tables()
-                for table in tables:
-                    for row in table:
-                        all_rows.append(row)
-
-        if not all_rows:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "No tables found in PDF"}
-            )
-
-        df = pd.DataFrame(all_rows)
-        df.to_excel(excel_path, index=False, header=False)
-
-        return FileResponse(
-            excel_path,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            filename="converted.xlsx"
+    # ---------- Validation ----------
+    if not file.filename.lower().endswith(".pdf"):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Only PDF files are allowed"}
         )
 
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+    pdf_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4()}.pdf")
+    excel_path = pdf_path.replace(".pdf", ".xlsx")
 
-# ---------------- PDF TO WORD ----------------
-@app.post("/pdf-to-word")
-async def pdf_to_word(file: UploadFile = File(...)):
+    # ---------- Save PDF ----------
+    with open(pdf_path, "wb") as f:
+        f.write(await file.read())
+
+    transactions = []
+
+    # ---------- PDF Parsing ----------
     try:
-        pdf_path = f"{BASE_DIR}/{uuid.uuid4()}.pdf"
-        docx_path = pdf_path.replace(".pdf", ".docx")
-
-        with open(pdf_path, "wb") as f:
-            f.write(await file.read())
-
-        doc = Document()
-
         with pdfplumber.open(pdf_path) as pdf:
             for page in pdf.pages:
                 text = page.extract_text()
-                if text:
-                    for line in text.split("\n"):
-                        doc.add_paragraph(line)
+                if not text:
+                    continue
 
-        doc.save(docx_path)
+                lines = text.split("\n")
 
-        return FileResponse(
-            docx_path,
-            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            filename="converted.docx"
-        )
+                for line in lines:
+                    date_match = DATE_REGEX.search(line)
+                    if not date_match:
+                        continue
+
+                    date = date_match.group()
+                    amounts = AMOUNT_REGEX.findall(line)
+
+                    debit = ""
+                    credit = ""
+                    balance = ""
+
+                    if len(amounts) >= 2:
+                        balance = amounts[-1]
+                        txn_amount = amounts[-2]
+
+                        upper_line = line.upper()
+
+                        if "CR" in upper_line or "CREDIT" in upper_line:
+                            credit = txn_amount
+                        elif "DR" in upper_line or "DEBIT" in upper_line:
+                            debit = txn_amount
+                        else:
+                            # Default assumption (most Indian banks)
+                            debit = txn_amount
+
+                    # ---------- Clean Description ----------
+                    description = line
+                    description = description.replace(date, "")
+
+                    for amt in amounts:
+                        description = description.replace(amt, "")
+
+                    description = (
+                        description
+                        .replace("DR", "")
+                        .replace("CR", "")
+                        .replace("Debit", "")
+                        .replace("Credit", "")
+                        .strip()
+                    )
+
+                    transactions.append([
+                        date,
+                        description,
+                        debit,
+                        credit,
+                        balance
+                    ])
 
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"PDF processing failed: {str(e)}"}
+        )
+
+    if not transactions:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "No transactions detected in PDF"}
+        )
+
+    # ---------- Create Excel ----------
+    df = pd.DataFrame(
+        transactions,
+        columns=["Date", "Description", "Debit", "Credit", "Balance"]
+    )
+
+    df.to_excel(excel_path, index=False)
+
+    # ---------- Return File ----------
+    return FileResponse(
+        excel_path,
+        filename="bank_statement.xlsx",
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
